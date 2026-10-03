@@ -249,7 +249,7 @@ func TestAuthCheckMiddlewareJWTAuthVersionLifecycle(t *testing.T) {
 	groupRef := uuid.New()
 	relationRef := uuid.New()
 	setupStatements := []string{
-		`create table user_account (id integer primary key, email text, name text, reference_id blob, auth_version integer not null default 1)`,
+		`create table user_account (id integer primary key, email text, name text, reference_id blob, auth_version integer not null default 1, active bool not null default 1)`,
 		`create table usergroup (id integer primary key, name text, reference_id blob)`,
 		`create table user_account_user_account_id_has_usergroup_usergroup_id (
 			id integer primary key,
@@ -265,7 +265,7 @@ func TestAuthCheckMiddlewareJWTAuthVersionLifecycle(t *testing.T) {
 			t.Fatalf("setup statement failed: %v", err)
 		}
 	}
-	if _, err := db.Exec(`insert into user_account (id, email, name, reference_id, auth_version) values (?, ?, ?, ?, ?)`, 1, "user@example.com", "Test User", userRef[:], 2); err != nil {
+	if _, err := db.Exec(`insert into user_account (id, email, name, reference_id, auth_version, active) values (?, ?, ?, ?, ?, 1)`, 1, "user@example.com", "Test User", userRef[:], 2); err != nil {
 		t.Fatalf("insert user: %v", err)
 	}
 	if _, err := db.Exec(`insert into usergroup (id, name, reference_id) values (?, ?, ?)`, 1, "users", groupRef[:]); err != nil {
@@ -332,6 +332,9 @@ func TestAuthCheckMiddlewareJWTAuthVersionLifecycle(t *testing.T) {
 		}
 		if sessionUser.AuthVersion != 2 {
 			t.Fatalf("expected session auth version 2, got %d", sessionUser.AuthVersion)
+		}
+		if !sessionUser.Active {
+			t.Fatal("expected session user to be active")
 		}
 	})
 

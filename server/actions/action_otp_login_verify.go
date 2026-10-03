@@ -154,6 +154,10 @@ func (d *otpLoginVerifyActionPerformer) DoAction(request actionresponse.Outcome,
 		return nil, responses, nil
 	}
 
+	if !resource.RowValueActive(userAccount[resource.ACTIVE_COLUMN_NAME]) {
+		return nil, nil, []error{errors.New("account is not active")}
+	}
+
 	tokenString, err := newAuthSessionToken(d.secret, d.tokenLifeTime, d.jwtTokenIssuer, userAccount, timeInstance, map[string]interface{}{
 		"picture": fmt.Sprintf("https://www.gravatar.com/avatar/%s&d=monsterid", resource.GetMD5HashString(strings.ToLower(userAccount["email"].(string)))),
 	})

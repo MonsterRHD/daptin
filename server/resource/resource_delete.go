@@ -547,6 +547,12 @@ func (dbResource *DbResource) deleteWithoutFiltersWithData(id daptinid.DaptinRef
 			return err
 		}
 
+		if m.GetTableName() == USER_ACCOUNT_TABLE_NAME {
+			if err := dbResource.revokeDeletedUserAccountSessionsWithTransaction(data, transaction); err != nil {
+				return err
+			}
+		}
+
 		queryBuilder := statementbuilder.Squirrel.
 			Delete(m.GetTableName()).Prepared(true).Where(goqu.Ex{"reference_id": id[:]})
 

@@ -108,6 +108,11 @@ func (dsa *DaptinSmtpAuthenticator) VerifyLOGIN(login, passwordBase64 string) bo
 	if err != nil {
 		return false
 	}
+	ownerActive, activeErr := resource.IsUserAccountActiveWithTransaction(
+		daptinid.InterfaceToDIR(mailAccount[resource.USER_ACCOUNT_ID_COLUMN]), transaction)
+	if activeErr != nil || !ownerActive {
+		return false
+	}
 	password, err := base64.StdEncoding.DecodeString(passwordBase64)
 	if err != nil {
 		return false

@@ -24,8 +24,10 @@ type Message map[string]interface{}
 type Server struct {
 	pattern       string
 	clients       map[int]*Client
+	userClients   map[string]map[int]*Client
 	addCh         chan *Client
 	delCh         chan *Client
+	revokeCh      chan string
 	doneCh        chan struct{}
 	stoppedCh     chan struct{}
 	stopOnce      sync.Once
@@ -42,6 +44,7 @@ func NewServer(pattern string, dtopicMap *map[string]*olric.PubSub, cruds map[st
 	clients := make(map[int]*Client)
 	addCh := make(chan *Client, 256)
 	delCh := make(chan *Client, 16)
+	revokeCh := make(chan string, 64)
 	doneCh := make(chan struct{})
 	errCh := make(chan error, 16)
 
@@ -52,8 +55,10 @@ func NewServer(pattern string, dtopicMap *map[string]*olric.PubSub, cruds map[st
 	return &Server{
 		pattern:      pattern,
 		clients:      clients,
+		userClients:  make(map[string]map[int]*Client),
 		addCh:        addCh,
 		delCh:        delCh,
+		revokeCh:     revokeCh,
 		doneCh:       doneCh,
 		stoppedCh:    make(chan struct{}),
 		errCh:        errCh,
@@ -62,6 +67,55 @@ func NewServer(pattern string, dtopicMap *map[string]*olric.PubSub, cruds map[st
 		cruds:        cruds,
 		sharedPubSub: sharedPubSub,
 	}
+}
+
+// WatchSessionRevocations subscribes to the cluster-wide user session
+// revocation topic and closes local websocket connections of revoked users.
+// It exits when the runtime context is cancelled.
+func (s *Server) WatchSessionRevocations(ctx context.Context) {
+	if s.sharedPubSub == nil {
+		return
+	}
+	// Channel() starts the receive loop on its own; no Receive handshake is
+	// needed (Receive would consume the first revocation event).
+	subscription := s.sharedPubSub.Subscribe(ctx, resource.UserSessionRevokeTopic)
+	go func() {
+		for message := range subscription.Channel() {
+			if message == nil {
+				continue
+			}
+			select {
+			case s.revokeCh <- message.Payload:
+			case <-s.doneCh:
+				_ = subscription.Close()
+				return
+			case <-ctx.Done():
+				_ = subscription.Close()
+				return
+			default:
+				// A saturated revocation queue must not block publishers;
+				// auth_version checks reject subsequent requests anyway.
+			}
+		}
+	}()
+}
+
+// CloseUserSessions enqueues closure of every websocket client owned by the
+// given user reference id.
+func (s *Server) CloseUserSessions(userReferenceId string) {
+	select {
+	case s.revokeCh <- userReferenceId:
+	case <-s.doneCh:
+	default:
+	}
+}
+
+func (s *Server) closeUserSessions(userReferenceId string) {
+	clients := s.userClients[userReferenceId]
+	for clientId := range clients {
+		clients[clientId].Close()
+	}
+	delete(s.userClients, userReferenceId)
 }
 
 func (s *Server) Add(c *Client) {
@@ -143,6 +197,11 @@ func (s *Server) Listen() {
 		// Add new a client
 		case c := <-s.addCh:
 			s.clients[c.id] = c
+			userReferenceId := c.user.UserReferenceId.String()
+			if s.userClients[userReferenceId] == nil {
+				s.userClients[userReferenceId] = make(map[int]*Client)
+			}
+			s.userClients[userReferenceId][c.id] = c
 			log.Infof("Added new client, %d clients connected", len(s.clients))
 
 			// del a client
@@ -150,6 +209,19 @@ func (s *Server) Listen() {
 			log.Infof("[126] delete client")
 			c.Close()
 			delete(s.clients, c.id)
+			if c.user != nil {
+				userReferenceId := c.user.UserReferenceId.String()
+				if clients := s.userClients[userReferenceId]; clients != nil {
+					delete(clients, c.id)
+					if len(clients) == 0 {
+						delete(s.userClients, userReferenceId)
+					}
+				}
+			}
+
+		case userReferenceId := <-s.revokeCh:
+			log.Infof("closing websocket sessions for revoked user %s", userReferenceId)
+			s.closeUserSessions(userReferenceId)
 
 		case err := <-s.errCh:
 			log.Infof("[136] error: %s", err.Error())
@@ -159,6 +231,7 @@ func (s *Server) Listen() {
 				client.Close()
 			}
 			clear(s.clients)
+			clear(s.userClients)
 			return
 		}
 	}

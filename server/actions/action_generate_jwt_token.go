@@ -61,7 +61,8 @@ func (d *generateJwtTokenActionPerformer) DoAction(request actionresponse.Outcom
 		return nil, responses, []error{fmt.Errorf("Invalid username or password")}
 	} else {
 		existingUser := existingUsers[0]
-		if skipPasswordCheck || (existingUser["password"] != nil && resource.BcryptCheckStringHash(password, existingUser["password"].(string))) {
+		if (skipPasswordCheck || (existingUser["password"] != nil && resource.BcryptCheckStringHash(password, existingUser["password"].(string)))) &&
+			resource.RowValueActive(existingUser[resource.ACTIVE_COLUMN_NAME]) {
 
 			// Create a new token object, specifying signing method and the claims
 			// you would like it to contain.

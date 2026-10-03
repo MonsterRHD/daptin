@@ -198,6 +198,9 @@ func (driver *DaptinFtpDriver) AuthUser(cc server.ClientContext, user, pass stri
 	if !ok || !resource.BcryptCheckStringHash(pass, passwordHash) {
 		return nil, fmt.Errorf("could not authenticate you")
 	}
+	if !resource.RowValueActive(userAccount[resource.ACTIVE_COLUMN_NAME]) {
+		return nil, fmt.Errorf("could not authenticate you")
+	}
 	userId, ok := userAccount["id"].(int64)
 	if !ok {
 		return nil, errors.New("invalid user account id")

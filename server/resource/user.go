@@ -1,5 +1,85 @@
 package resource
 
+import (
+	"strings"
+
+	"github.com/daptin/daptin/server/auth"
+	daptinid "github.com/daptin/daptin/server/id"
+	"github.com/doug-martin/goqu/v9"
+	"github.com/jmoiron/sqlx"
+)
+
+// Columns carrying the SCIM account lifecycle state.
+var (
+	ACTIVE_COLUMN_NAME      = auth.ActiveColumn
+	EXTERNAL_ID_COLUMN_NAME = "external_id"
+)
+
+// RowValueActive normalizes values stored in user_account.active across
+// SQL drivers (bool, int64, string) into a boolean. A missing value means
+// active for legacy rows predating the column.
+func RowValueActive(value interface{}) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case bool:
+		return v
+	case int:
+		return v != 0
+	case int8:
+		return v != 0
+	case int16:
+		return v != 0
+	case int32:
+		return v != 0
+	case int64:
+		return v != 0
+	case uint:
+		return v != 0
+	case uint8:
+		return v != 0
+	case uint16:
+		return v != 0
+	case uint32:
+		return v != 0
+	case uint64:
+		return v != 0
+	case float32:
+		return v != 0
+	case float64:
+		return v != 0
+	case string:
+		return parseStoredBool(v)
+	case []byte:
+		return parseStoredBool(string(v))
+	default:
+		return true
+	}
+}
+
+func parseStoredBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "0", "false", "f", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+// IsUserAccountActiveWithTransaction reports whether the linked user_account
+// is allowed to log in. A missing user means inactive for protocol logins.
+func IsUserAccountActiveWithTransaction(userReference daptinid.DaptinReferenceId, transaction *sqlx.Tx) (bool, error) {
+	rows, err := GetObjectByWhereClauseWithTransaction(USER_ACCOUNT_TABLE_NAME, transaction,
+		goqu.Ex{"reference_id": userReference[:]})
+	if err != nil {
+		return false, err
+	}
+	if len(rows) < 1 {
+		return false, nil
+	}
+	return RowValueActive(rows[0][ACTIVE_COLUMN_NAME]), nil
+}
+
 //
 //import (
 //	"fmt"

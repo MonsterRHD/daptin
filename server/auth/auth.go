@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -21,7 +22,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +30,9 @@ import (
 
 const AuthVersionClaim = "auth_version"
 const AuthVersionColumn = "auth_version"
+
+// ActiveColumn is the user_account column that gates every login channel.
+const ActiveColumn = "active"
 
 type AuthPermission int64
 
@@ -81,6 +84,7 @@ func (a AuthPermission) String() string {
 type ResourceAdapter interface {
 	api2go.CRUD
 	GetUserPassword(email string, transaction *sqlx.Tx) (string, error)
+	GetUserActiveByEmail(email string, transaction *sqlx.Tx) (bool, error)
 }
 
 type AuthMiddleware struct {
@@ -185,12 +189,17 @@ func (a *AuthMiddleware) BasicAuthCheckMiddlewareWithHttp(req *http.Request, wri
 	}
 
 	existingPasswordHash, err := a.userCrud.GetUserPassword(username, transaction)
+	if err != nil {
+		transaction.Rollback()
+		return
+	}
+	userActive, err := a.userCrud.GetUserActiveByEmail(username, transaction)
 	transaction.Rollback()
 	if err != nil {
 		return
 	}
 
-	if BcryptCheckStringHash(password, existingPasswordHash) {
+	if userActive && BcryptCheckStringHash(password, existingPasswordHash) {
 		token = &jwt.Token{
 			Claims: jwt.MapClaims{
 				"name":  strings.Split(username, "@")[0],
@@ -385,16 +394,13 @@ func (a *AuthMiddleware) AuthCheckMiddlewareWithHttp(req *http.Request, writer h
 		} else {
 
 			userToken := userJwtToken
-			var tokenAuthVersion int64
 			if hasJWTUser {
-				tokenAuthVersion, err = AuthVersionFromJWTToken(userToken)
-				if err != nil {
+				if _, err := AuthVersionFromJWTToken(userToken); err != nil {
 					log.Warnf("JWT auth version check failed: %v", err)
 					return false, false, req
 				}
 			}
 			email := userToken.Claims.(jwt.MapClaims)["email"].(string)
-			name := userToken.Claims.(jwt.MapClaims)["name"].(string)
 			//log.Printf("User is not nil: %v", email)
 
 			var sessionUser *SessionUser
@@ -423,9 +429,10 @@ func (a *AuthMiddleware) AuthCheckMiddlewareWithHttp(req *http.Request, writer h
 				if err != nil || cachedUser == nil {
 					//log.Errorf("cached user [%v] is nil", email)
 
-					sql, args, err := statementbuilder.Squirrel.Select(goqu.I("u.id"),
+					selectSQL, args, err := statementbuilder.Squirrel.Select(goqu.I("u.id"),
 						goqu.I("u.reference_id"),
-						goqu.I("u."+AuthVersionColumn)).Prepared(true).
+						goqu.I("u."+AuthVersionColumn),
+						goqu.I("u."+ActiveColumn)).Prepared(true).
 						From(goqu.T("user_account").As("u")).Where(
 						goqu.Ex{"email": email}).ToSQL()
 					if err != nil {
@@ -433,7 +440,7 @@ func (a *AuthMiddleware) AuthCheckMiddlewareWithHttp(req *http.Request, writer h
 						return false, true, req
 					}
 
-					stmt1, err := a.db.Preparex(sql)
+					stmt1, err := a.db.Preparex(selectSQL)
 					if err != nil {
 						log.Errorf("[315] failed to prepare statment: %v", err)
 						return false, true, req
@@ -441,107 +448,63 @@ func (a *AuthMiddleware) AuthCheckMiddlewareWithHttp(req *http.Request, writer h
 
 					rowx := stmt1.QueryRowx(args...)
 					var authVersion int64
-					err = rowx.Scan(&userId, &referenceIdBytes, &authVersion)
-					err = stmt1.Close()
-					if err != nil {
-						log.Errorf("failed to close prepared statement: %v", err)
+					var userActive bool
+					scanErr := rowx.Scan(&userId, &referenceIdBytes, &authVersion, &userActive)
+					if closeErr := stmt1.Close(); closeErr != nil {
+						log.Errorf("failed to close prepared statement: %v", closeErr)
+					}
+
+					if scanErr != nil {
+						// A missing identity (deleted or unknown user) must never
+						// become an authenticated zero-value session.
+						if errors.Is(scanErr, sql.ErrNoRows) {
+							log.Warnf("rejecting token for unknown or deleted user account [%v]", email)
+							return false, false, req
+						}
+						log.Errorf("Failed to scan user [%v] from db: %v", email, scanErr)
+						return false, true, req
 					}
 
 					uu, _ := uuid.FromBytes(referenceIdBytes[:])
 
 					referenceId := daptinid.DaptinReferenceId(uu)
 
+					query, args1, err := UserGroupSelectQuery.Where(goqu.Ex{"uug.user_account_id": userId}).ToSQL()
+
+					groupStmt, err := a.db.Preparex(query)
 					if err != nil {
-						// if a user logged in from third party oauth login
-						log.Errorf("Failed to scan user [%v] from db: %v", email, err)
-
-						mapData := make(map[string]interface{})
-						mapData["name"] = name
-						mapData["email"] = email
-						mapData[AuthVersionColumn] = tokenAuthVersion
-
-						newUser := api2go.NewApi2GoModelWithData("user_account", nil, int64(DEFAULT_PERMISSION), nil, mapData)
-						ur, _ := url.Parse("/user_account")
-
-						req1 := api2go.Request{
-							PlainRequest: &http.Request{
-								Method: "POST",
-								URL:    ur,
-							},
-						}
-
-						resp, err := a.userCrud.Create(newUser, req1)
+						log.Errorf("[382] failed to prepare statment: %v", err)
+						return false, true, nil
+					}
+					defer func(stmt1 *sqlx.Stmt) {
+						err := stmt1.Close()
 						if err != nil {
-							log.Errorf("Failed to create new user: %v", err)
-							abortRequest = true
-							return okToContinue, abortRequest, req
+							log.Errorf("failed to close prepared statement: %v", err)
 						}
-						referenceId = daptinid.DaptinReferenceId([]byte((resp.Result().(api2go.Api2GoModel)).GetID()))
+					}(groupStmt)
 
-						mapData = make(map[string]interface{})
-						mapData["name"] = "Home group of " + name
-
-						newUserGroup := api2go.NewApi2GoModelWithData("usergroup", nil, int64(DEFAULT_PERMISSION), nil, mapData)
-
-						resp, err = a.userGroupCrud.Create(newUserGroup, req1)
-						if err != nil {
-							log.Errorf("Failed to create new user group: %v", err)
-						}
-						userGroupId := daptinid.DaptinReferenceId([]byte((resp.Result().(api2go.Api2GoModel)).GetID()))
-
-						userGroups = make([]GroupPermission, 0)
-						mapData = make(map[string]interface{})
-						mapData["user_account_id"] = referenceId
-						mapData["usergroup_id"] = userGroupId
-
-						newUserUserGroup := api2go.NewApi2GoModelWithData("user_account_user_account_id_has_usergroup_usergroup_id", nil, int64(DEFAULT_PERMISSION), nil, mapData)
-
-						uug, err := a.userUserGroupCrud.Create(newUserUserGroup, req1)
-						if err != nil {
-							log.Errorf("Failed to create user-usergroup relation: %v", err)
-						}
-						log.Printf("User ug: %v", uug)
-
+					rows, err := groupStmt.Queryx(args1...)
+					if err != nil {
+						log.Errorf("Failed to get user group permissions: %v", err)
 					} else {
+						defer func() {
+							if err := rows.Close(); err != nil {
+								log.Errorf("failed to close result after fetching user in auth: %v", err)
+							}
+						}()
 
-						query, args1, err := UserGroupSelectQuery.Where(goqu.Ex{"uug.user_account_id": userId}).ToSQL()
-
-						stmt1, err := a.db.Preparex(query)
-						if err != nil {
-							log.Errorf("[382] failed to prepare statment: %v", err)
-							return false, true, nil
-						}
-						defer func(stmt1 *sqlx.Stmt) {
-							err := stmt1.Close()
+						//log.Debugf("Usergroup selection query for user [%v] : [%v]", email)
+						for rows.Next() {
+							var p GroupPermission
+							err = rows.StructScan(&p)
+							p.ObjectReferenceId = referenceId
 							if err != nil {
-								log.Errorf("failed to close prepared statement: %v", err)
+								log.Errorf("failed to scan group permission struct: %v", err)
+								continue
 							}
-						}(stmt1)
-
-						rows, err := stmt1.Queryx(args1...)
-						if err != nil {
-							log.Errorf("Failed to get user group permissions: %v", err)
-						} else {
-							defer func() {
-								if err := rows.Close(); err != nil {
-									log.Errorf("failed to close result after fetching user in auth: %v", err)
-								}
-							}()
-
-							//cols, _ := rows.Columns()
-							//log.Debugf("Usergroup selection query for user [%v] : [%v]", email, query)
-							for rows.Next() {
-								var p GroupPermission
-								err = rows.StructScan(&p)
-								p.ObjectReferenceId = referenceId
-								if err != nil {
-									log.Errorf("failed to scan group permission struct: %v", err)
-									continue
-								}
-								userGroups = append(userGroups, p)
-							}
-
+							userGroups = append(userGroups, p)
 						}
+
 					}
 
 					//log.Printf("Group permissions :%v", userGroups)
@@ -551,6 +514,7 @@ func (a *AuthMiddleware) AuthCheckMiddlewareWithHttp(req *http.Request, writer h
 						UserReferenceId: referenceId,
 						Groups:          userGroups,
 						AuthVersion:     AuthVersionOrDefault(authVersion),
+						Active:          userActive,
 					}
 					//
 					LocalUserCacheLock.Lock()
@@ -598,6 +562,11 @@ func (a *AuthMiddleware) AuthCheckMiddlewareWithHttp(req *http.Request, writer h
 				}
 			}
 
+			if !sessionUser.Active {
+				log.Warnf("inactive user account [%v] attempted an authenticated request", email)
+				return false, false, req
+			}
+
 			//log.Tracef("User cache map size: %v", len(LocalUserCacheMap))
 
 			ct := req.Context()
@@ -630,6 +599,7 @@ type SessionUser struct {
 	UserReferenceId daptinid.DaptinReferenceId
 	Groups          GroupPermissionList
 	AuthVersion     int64
+	Active          bool
 }
 
 // InvalidateAuthCacheForEmail removes the cached SessionUser for the given email,
@@ -663,6 +633,12 @@ func (s SessionUser) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(authVersionData, uint64(AuthVersionOrDefault(s.AuthVersion)))
 	data = append(data, authVersionData...)
 
+	if s.Active {
+		data = append(data, 1)
+	} else {
+		data = append(data, 0)
+	}
+
 	return data, nil
 }
 
@@ -679,11 +655,21 @@ func (s *SessionUser) UnmarshalBinary(data []byte) error {
 
 	groupEnd := len(data)
 	remainder := len(data) - 24
-	if remainder%56 == 8 {
+	hasActiveByte := remainder >= 9 && (remainder-9)%56 == 0
+	hasAuthVersion := hasActiveByte || remainder%56 == 8
+	if hasActiveByte {
+		groupEnd = len(data) - 9
+		s.AuthVersion = int64(binary.LittleEndian.Uint64(data[groupEnd : groupEnd+8]))
+		s.Active = data[len(data)-1] != 0
+	} else if hasAuthVersion {
 		groupEnd = len(data) - 8
 		s.AuthVersion = int64(binary.LittleEndian.Uint64(data[groupEnd:]))
+		// Entries cached before the active column existed belong to active
+		// accounts; deactivation invalidates the cache key anyway.
+		s.Active = true
 	} else {
 		s.AuthVersion = 1
+		s.Active = true
 	}
 
 	position := 24

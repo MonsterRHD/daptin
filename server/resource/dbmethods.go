@@ -1139,6 +1139,21 @@ func (dbResource *DbResource) GetUserPassword(email string, transaction *sqlx.Tx
 	return passwordHash, err
 }
 
+// GetUserActiveByEmail returns the login state of the user with the given
+// email. Protocol adapters using HTTP Basic auth call it after a successful
+// password check so inactive accounts are denied on every login channel.
+func (dbResource *DbResource) GetUserActiveByEmail(email string, transaction *sqlx.Tx) (bool, error) {
+	existingUsers, _, err := dbResource.Cruds[USER_ACCOUNT_TABLE_NAME].GetRowsByWhereClause(USER_ACCOUNT_TABLE_NAME, nil, transaction, goqu.Ex{"email": email})
+	if err != nil {
+		return false, err
+	}
+	if len(existingUsers) < 1 {
+		return false, errors.New("user not found")
+	}
+
+	return RowValueActive(existingUsers[0][ACTIVE_COLUMN_NAME]), nil
+}
+
 // UserGroupNameToId Converts group name to the internal integer id
 func (dbResource *DbResource) UserGroupNameToId(groupName string) (uint64, error) {
 

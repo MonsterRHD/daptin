@@ -680,6 +680,10 @@ func NewRuntime(ctx context.Context, boxRoot http.FileSystem, db database.Databa
 
 	InitializeOAuthResources(cruds, configStore, defaultRouter)
 
+	if err := InitializeScimResources(defaultRouter, db, cruds, configStore); err != nil {
+		return nil, fmt.Errorf("failed to initialize SCIM: %w", err)
+	}
+
 	resource.RegisterTranslations()
 
 	if initConfig.EnableGraphQL {
@@ -720,6 +724,7 @@ func NewRuntime(ctx context.Context, boxRoot http.FileSystem, db database.Databa
 
 	SetupNoRouteRouter(boxRoot, defaultRouter)
 	websocketServer.Register(defaultRouter)
+	websocketServer.WatchSessionRevocations(ctx)
 	go websocketServer.Listen()
 
 	//defaultRouter.Run(fmt.Sprintf(":%v", *port))

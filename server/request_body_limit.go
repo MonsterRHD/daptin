@@ -55,6 +55,8 @@ func bufferedRequestPath(method, path string) bool {
 		return method == http.MethodPost
 	case strings.HasPrefix(path, "/track/start/"):
 		return method == http.MethodPost
+	case strings.HasPrefix(path, "/scim/v2/Users"), strings.HasPrefix(path, "/scim/v2/Groups"):
+		return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch
 	}
 	return false
 }

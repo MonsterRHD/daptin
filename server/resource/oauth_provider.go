@@ -521,11 +521,15 @@ func (op *OAuthProvider) sessionUserFromRow(row map[string]interface{}, transact
 	if userRef == daptinid.NullReferenceId {
 		return nil, fmt.Errorf("oauth row has no user_account owner")
 	}
-	userID, err := op.cruds[USER_ACCOUNT_TABLE_NAME].GetReferenceIdToId(USER_ACCOUNT_TABLE_NAME, userRef, transaction)
-	if err != nil {
-		return nil, fmt.Errorf("resolve oauth user_account owner: %w", err)
+	userRow, err := op.cruds[USER_ACCOUNT_TABLE_NAME].GetReferenceIdToObjectWithTransaction(USER_ACCOUNT_TABLE_NAME, userRef, transaction)
+	if err != nil || userRow == nil {
+		return nil, fmt.Errorf("invalid token")
 	}
-	if userID <= 0 {
+	if !RowValueActive(userRow[ACTIVE_COLUMN_NAME]) {
+		return nil, fmt.Errorf("invalid token")
+	}
+	userID, err := ResourceRowInt64(userRow["id"])
+	if err != nil || userID <= 0 {
 		return nil, fmt.Errorf("invalid user_account id: must be positive")
 	}
 	groups := op.cruds[USER_ACCOUNT_TABLE_NAME].GetObjectUserGroupsByWhereWithTransaction(USER_ACCOUNT_TABLE_NAME, transaction, "id", userID)
@@ -533,6 +537,7 @@ func (op *OAuthProvider) sessionUserFromRow(row map[string]interface{}, transact
 		UserId:          userID,
 		UserReferenceId: userRef,
 		Groups:          groups,
+		Active:          true,
 	}, nil
 }
 

@@ -112,6 +112,8 @@ func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.R
 	var colsList []string
 	var valsList []interface{}
 	passwordChanged := false
+	activeChanged := false
+	newActiveValue := true
 	if len(allChanges) > 0 {
 		for _, col := range allColumns {
 
@@ -392,6 +394,13 @@ func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.R
 				}
 			}
 
+			if dbResource.model.GetName() == USER_ACCOUNT_TABLE_NAME && col.ColumnName == ACTIVE_COLUMN_NAME {
+				if RowValueActive(change.OldValue) != RowValueActive(val) {
+					activeChanged = true
+					newActiveValue = RowValueActive(val)
+				}
+			}
+
 			if col.ColumnType == "json" {
 				val, err = jsonColumnStorageValue(val)
 				if err != nil {
@@ -421,7 +430,7 @@ func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.R
 			for i := range colsList {
 				setVals[colsList[i]] = valsList[i]
 			}
-			if passwordChanged {
+			if passwordChanged || activeChanged {
 				setVals[auth.AuthVersionColumn] = goqu.L("COALESCE(auth_version, 1) + 1")
 			}
 			builder = builder.Set(goqu.Record(setVals))
@@ -524,7 +533,8 @@ func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.R
 		}
 	}
 
-	if passwordChanged {
+	credentialOrStateChanged := passwordChanged || activeChanged
+	if credentialOrStateChanged {
 		seenEmails := make(map[string]bool)
 		for _, emailValue := range []interface{}{
 			data.GetColumnOriginalValue("email"),
@@ -538,6 +548,18 @@ func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.R
 			auth.InvalidateAuthCacheForEmail(email)
 		}
 		jwtmiddleware.InvalidateTokenCache()
+	}
+
+	if activeChanged {
+		InvalidateAdminCacheForUser(updatedRefId)
+		if !newActiveValue {
+			if userID, ok := idInt.(int64); ok && userID > 0 {
+				if err := revokeUserAccountOAuthTokensWithTransaction(userID, updateTransaction); err != nil {
+					return nil, err
+				}
+			}
+			publishUserSessionRevoke(dbResource.PubSub, updatedRefId)
+		}
 	}
 
 	// Invalidate parent permission caches when any usergroup relation row is updated

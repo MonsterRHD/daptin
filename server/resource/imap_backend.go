@@ -83,6 +83,15 @@ func (be *DaptinImapBackend) Login(conn *imap.ConnInfo, username, password strin
 		return nil, err
 	}
 
+	userActive, activeErr := IsUserAccountActiveWithTransaction(sessionUser.UserReferenceId, transaction)
+	if activeErr != nil || !userActive {
+		if activeErr != nil {
+			log.Printf("[IMAP] Login: failed to resolve owner account state for %s: %v", username, activeErr)
+		}
+		be.recordFailedLogin(username)
+		return nil, errors.New("bad username or password")
+	}
+
 	mailPassword, _ := userMailAccount["password"].(string)
 	if BcryptCheckStringHash(password, mailPassword) {
 		transaction.Commit()
