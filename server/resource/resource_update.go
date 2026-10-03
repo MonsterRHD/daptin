@@ -160,9 +160,9 @@ func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.R
 						valAsDir := daptinid.InterfaceToDIR(val)
 
 						foreignObjectId, err := GetReferenceIdToIdWithTransaction(col.ForeignKeyData.Namespace, valAsDir, updateTransaction)
-						if err != nil {
-							return nil, err
-						}
+					if err != nil {
+						return nil, err
+					}
 
 						if canRefer(col.ForeignKeyData.Namespace, valAsDir) {
 							val = foreignObjectId
@@ -412,6 +412,66 @@ func (dbResource *DbResource) updateWithoutFilters(obj interface{}, req api2go.R
 
 		colsList = append(colsList, "version")
 		valsList = append(valsList, data.GetNextVersion())
+
+		if dbResource.model.GetName() == "mail" {
+			// MODSEQ bumps on actual flag changes and mailbox moves. A server
+			// path (UpdateMailFlags) already supplies modseq, so this only runs
+			// for external (JSON:API) PATCHes.
+			if _, serverProvided := allChanges["modseq"]; !serverProvided {
+				baseline, err := loadMailChangeBaseline(updateObjectReferenceId[:], updateTransaction)
+				if err != nil {
+					return nil, err
+				}
+				mailBoxCrud := dbResource.Cruds["mail_box"]
+				if mailBoxCrud == nil {
+					return nil, errors.New("mail_box resource is not configured")
+				}
+
+				if flagsChange, ok := allChanges["flags"]; ok {
+					newFlags, _ := flagsChange.NewValue.(string)
+					if !FlagsEqual(FlagsFromStoredString(baseline.flags), FlagsFromStoredString(newFlags)) {
+						newModSeq, err := mailBoxCrud.AllocateMailBoxModSeq(baseline.mailBoxId, updateTransaction)
+						if err != nil {
+							return nil, err
+						}
+						setUpdateColumn(&colsList, &valsList, "modseq", newModSeq)
+					}
+				}
+
+				if boxChange, ok := allChanges["mail_box_id"]; ok {
+					// Source mailbox: the mail vanishes, so leave history.
+					if _, err := mailBoxCrud.InitDeletionHistoryWatermark(baseline.mailBoxId, updateTransaction); err != nil {
+						return nil, err
+					}
+					sourceModSeq, err := mailBoxCrud.AllocateMailBoxModSeq(baseline.mailBoxId, updateTransaction)
+					if err != nil {
+						return nil, err
+					}
+					uid := baseline.uid
+					if uid == 0 {
+						uid = baseline.id
+					}
+					if err := dbResource.RecordMailDeletion(baseline.mailBoxId, uint32(uid), sourceModSeq, req, updateTransaction); err != nil {
+						return nil, fmt.Errorf("record source deletion: %w", err)
+					}
+
+					// Destination mailbox: the same mail (UID unchanged) gets a
+					// new modseq so CHANGEDSINCE returns it as added/changed.
+					newBoxId, err := resolveRelatedInternalId(boxChange.NewValue, "mail_box", updateTransaction)
+					if err != nil {
+						return nil, fmt.Errorf("resolve destination mailbox: %w", err)
+					}
+					if newBoxId == 0 {
+						return nil, fmt.Errorf("unknown destination mail_box: %v", boxChange.NewValue)
+					}
+					destModSeq, err := mailBoxCrud.AllocateMailBoxModSeq(newBoxId, updateTransaction)
+					if err != nil {
+						return nil, fmt.Errorf("allocate destination modseq: %w", err)
+					}
+					setUpdateColumn(&colsList, &valsList, "modseq", destModSeq)
+				}
+			}
+		}
 
 		if len(languagePreferences) == 0 {
 

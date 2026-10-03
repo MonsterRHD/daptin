@@ -1,6 +1,8 @@
 package resource
 
 import (
+	"errors"
+
 	"github.com/artpar/api2go/v2"
 	"github.com/daptin/daptin/server/actionresponse"
 	"github.com/daptin/daptin/server/auth"
@@ -86,6 +88,32 @@ func (dbResource *DbResource) deleteWithoutFiltersWithData(id daptinid.DaptinRef
 	transaction *sqlx.Tx, data map[string]interface{}) error {
 	var err error
 	apiModel := api2go.NewApi2GoModelWithData(dbResource.model.GetTableName(), nil, 0, nil, data)
+
+	// Mail deletion: the expunged UID must leave queryable history before
+	// the row is removed. The watermark is initialized lazily, so mailboxes
+	// that predate QRESYNC instrumentation cannot silently miss old deletes.
+	if dbResource.model.GetName() == "mail" {
+		mailBoxId, err := resolveRelatedInternalId(data["mail_box_id"], "mail_box", transaction)
+		if err != nil {
+			return err
+		}
+		if mailBoxId != 0 {
+			mailBoxCrud, ok := dbResource.Cruds["mail_box"]
+			if !ok {
+				return errors.New("mail_box resource is not configured")
+			}
+			if _, err := mailBoxCrud.InitDeletionHistoryWatermark(mailBoxId, transaction); err != nil {
+				return err
+			}
+			deletionModSeq, err := mailBoxCrud.AllocateMailBoxModSeq(mailBoxId, transaction)
+			if err != nil {
+				return err
+			}
+			if err := dbResource.RecordMailDeletion(mailBoxId, EffectiveMailUID(data), deletionModSeq, req, transaction); err != nil {
+				return err
+			}
+		}
+	}
 
 	m := dbResource.model
 	//log.Printf("Get all resource type: %v\n", m)

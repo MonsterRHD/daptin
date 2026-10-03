@@ -405,6 +405,33 @@ func (dbResource *DbResource) createWithoutFilter(obj interface{}, req api2go.Re
 		valsList = append(valsList, columnValue)
 	}
 
+	if dbResource.model.GetName() == "mail" {
+		// Server is the sole MODSEQ authority: every mail created in a real
+		// mailbox gets a fresh, persistent modseq, no matter which entry
+		// (APPEND/COPY/SMTP/JSON:API) created it. Any client-provided value is
+		// ignored. Mails without a destination mailbox are skipped.
+		if mailBoxId, ok := internalIdFromValue(dataToInsert["mail_box_id"]); ok && mailBoxId != 0 {
+			mailBoxCrud := dbResource.Cruds["mail_box"]
+			if mailBoxCrud == nil {
+				return nil, errors.New("mail_box resource is not configured")
+			}
+			newModSeq, err := mailBoxCrud.AllocateMailBoxModSeq(mailBoxId, createTransaction)
+			if err != nil {
+				return nil, err
+			}
+			dataToInsert["modseq"] = newModSeq
+			setInsertColumn(&colsList, &valsList, "modseq", newModSeq)
+		}
+	} else if dbResource.model.GetName() == "mail_box" {
+		// New mailboxes start with a zero deletion watermark: all deletions are
+		// instrumented from creation. NULL stays reserved for legacy mailboxes
+		// present before QRESYNC was installed.
+		if !InArray(colsList, "deletion_history_modseq") {
+			colsList = append(colsList, "deletion_history_modseq")
+			valsList = append(valsList, int64(0))
+		}
+	}
+
 	if !InArray(colsList, "reference_id") {
 		colsList = append(colsList, "reference_id")
 		valsList = append(valsList, newObjectReferenceId[:])

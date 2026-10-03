@@ -636,8 +636,8 @@ func (dbResource *DbResource) GetFirstUnseenMailSequence(mailBoxId int64, transa
 	return seqNum + 1 // 1-based sequence number
 
 }
-func (dbResource *DbResource) UpdateMailFlags(mailReferenceID daptinid.DaptinReferenceId, newFlags []string,
-	sessionUser *auth.SessionUser, transaction *sqlx.Tx) error {
+func (dbResource *DbResource) UpdateMailFlags(mailBoxId int64, mailReferenceID daptinid.DaptinReferenceId,
+	newFlags []string, sessionUser *auth.SessionUser, transaction *sqlx.Tx) error {
 
 	log.Tracef("[UpdateMailFlags] Updating flags for mail=%s flags=%v", mailReferenceID, newFlags)
 	seen := false
@@ -655,11 +655,21 @@ func (dbResource *DbResource) UpdateMailFlags(mailReferenceID daptinid.DaptinRef
 		seen = true
 	}
 
+	mailBoxCrud := dbResource.Cruds["mail_box"]
+	if mailBoxCrud == nil {
+		return errors.New("mail_box resource is not configured")
+	}
+	newModSeq, err := mailBoxCrud.AllocateMailBoxModSeq(mailBoxId, transaction)
+	if err != nil {
+		return err
+	}
+
 	model := api2go.NewApi2GoModelWithData("mail", nil, 0, nil, map[string]interface{}{
 		"flags":   strings.Join(newFlags, ","),
 		"seen":    seen,
 		"recent":  recent,
 		"deleted": deleted,
+		"modseq":  newModSeq,
 	})
 	model.SetID(mailReferenceID.String())
 	requestURL, _ := url.Parse("/api/mail/" + mailReferenceID.String())
@@ -667,7 +677,7 @@ func (dbResource *DbResource) UpdateMailFlags(mailReferenceID daptinid.DaptinRef
 		Method: http.MethodPatch,
 		URL:    requestURL,
 	}).WithContext(context.WithValue(context.Background(), "user", sessionUser))}
-	_, err := dbResource.updateAfterAuthorizationWithTransaction(model, request, transaction)
+	_, err = dbResource.updateAfterAuthorizationWithTransaction(model, request, transaction)
 	log.Tracef("[UpdateMailFlags] Update complete, err=%v", err)
 	return err
 

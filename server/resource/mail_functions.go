@@ -177,7 +177,8 @@ func (dbResource *DbResource) CreateMailAccountBox(mailAccountId string,
 		"subscribed":      true,
 		"attributes":      "",
 		"flags":           "\\*",
-		"permanent_flags": "\\*",
+		"permanent_flags":          "\\*",
+		"deletion_history_modseq":  int64(0),
 	}), api2go.Request{
 		PlainRequest: httpRequest,
 	}, transaction)

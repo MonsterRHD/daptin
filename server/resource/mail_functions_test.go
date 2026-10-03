@@ -286,6 +286,8 @@ func newSentMailTestEnv(t *testing.T, existingSent bool) sentMailTestEnv {
 			attributes text,
 			flags text,
 			permanent_flags text,
+			highestmodseq integer default 0,
+			deletion_history_modseq integer,
 			user_account_id integer,
 			reference_id blob,
 			permission integer,
@@ -302,6 +304,7 @@ func newSentMailTestEnv(t *testing.T, existingSent bool) sentMailTestEnv {
 		)`,
 		`create table mail (
 			id integer primary key,
+			version integer default 1,
 			message_id text,
 			mail_id text,
 			from_address text,
@@ -324,11 +327,23 @@ func newSentMailTestEnv(t *testing.T, existingSent bool) sentMailTestEnv {
 			mail_box_id integer,
 			user_account_id integer,
 			uid integer,
+			modseq integer default 0,
 			seen bool,
 			recent bool,
 			deleted bool,
 			size integer,
 			flags text,
+			reference_id blob,
+			permission integer,
+			created_at timestamp,
+			updated_at timestamp
+		)`,
+		`create table mail_deletion (
+			id integer primary key,
+			mail_box_id integer,
+			uid integer,
+			modseq integer,
+			user_account_id integer,
 			reference_id blob,
 			permission integer,
 			created_at timestamp,
@@ -382,11 +397,13 @@ func newSentMailTestCrudGraph(t *testing.T, db *sqlx.DB, adminGroupRef daptinid.
 	mailAccountCrud := sentMailTestCrud(db, "mail_account", sentMailAccountColumns(), int64(auth.DEFAULT_PERMISSION))
 	mailBoxCrud := sentMailTestCrud(db, "mail_box", sentMailBoxColumns(), 16256)
 	mailCrud := sentMailTestCrud(db, "mail", sentMailColumns(), 768)
+	mailDeletionCrud := sentMailTestCrud(db, "mail_deletion", sentMailDeletionColumns(), 768)
 
 	cruds[USER_ACCOUNT_TABLE_NAME] = userAccountCrud
 	cruds["mail_account"] = mailAccountCrud
 	cruds["mail_box"] = mailBoxCrud
 	cruds["mail"] = mailCrud
+	cruds["mail_deletion"] = mailDeletionCrud
 	for _, crud := range cruds {
 		crud.Cruds = cruds
 		crud.AdministratorGroupId = adminGroupRef
@@ -464,6 +481,8 @@ func sentMailBoxColumns() []api2go.ColumnInfo {
 		{Name: "attributes", ColumnName: "attributes", DataType: "varchar(100)", ColumnType: "label"},
 		{Name: "flags", ColumnName: "flags", DataType: "varchar(100)", ColumnType: "label"},
 		{Name: "permanent_flags", ColumnName: "permanent_flags", DataType: "varchar(100)", ColumnType: "label"},
+		{Name: "highestmodseq", ColumnName: "highestmodseq", DataType: "bigint", ColumnType: "value"},
+		{Name: "deletion_history_modseq", ColumnName: "deletion_history_modseq", DataType: "bigint", ColumnType: "value", IsNullable: true},
 		{Name: "user_account_id", ColumnName: "user_account_id", DataType: "int(11)", ColumnType: "value"},
 		{Name: "reference_id", ColumnName: "reference_id", DataType: "blob", ColumnType: "alias"},
 		{Name: "permission", ColumnName: "permission", DataType: "integer"},
@@ -513,6 +532,32 @@ func sentMailColumns() []api2go.ColumnInfo {
 		{Name: "deleted", ColumnName: "deleted", DataType: "bool", ColumnType: "truefalse"},
 		{Name: "size", ColumnName: "size", DataType: "int(11)", ColumnType: "value"},
 		{Name: "flags", ColumnName: "flags", DataType: "varchar(500)", ColumnType: "label"},
+		{Name: "modseq", ColumnName: "modseq", DataType: "bigint", ColumnType: "value"},
+		{Name: "reference_id", ColumnName: "reference_id", DataType: "blob", ColumnType: "alias"},
+		{Name: "permission", ColumnName: "permission", DataType: "integer"},
+		{Name: "created_at", ColumnName: "created_at", DataType: "timestamp", ColumnType: "datetime"},
+		{Name: "updated_at", ColumnName: "updated_at", DataType: "timestamp", ColumnType: "datetime", IsNullable: true},
+	}
+}
+
+func sentMailDeletionColumns() []api2go.ColumnInfo {
+	return []api2go.ColumnInfo{
+		{Name: "id", ColumnName: "id", DataType: "INTEGER", ColumnType: "id", IsAutoIncrement: true},
+		{
+			Name:         "mail_box",
+			ColumnName:   "mail_box_id",
+			DataType:     "int(11)",
+			ColumnType:   "alias",
+			IsForeignKey: true,
+			ForeignKeyData: api2go.ForeignKeyData{
+				Namespace:  "mail_box",
+				KeyName:    "id",
+				DataSource: "self",
+			},
+		},
+		{Name: "uid", ColumnName: "uid", DataType: "int(11)", ColumnType: "value"},
+		{Name: "modseq", ColumnName: "modseq", DataType: "bigint", ColumnType: "value"},
+		{Name: "user_account_id", ColumnName: "user_account_id", DataType: "int(11)", ColumnType: "value"},
 		{Name: "reference_id", ColumnName: "reference_id", DataType: "blob", ColumnType: "alias"},
 		{Name: "permission", ColumnName: "permission", DataType: "integer"},
 		{Name: "created_at", ColumnName: "created_at", DataType: "timestamp", ColumnType: "datetime"},

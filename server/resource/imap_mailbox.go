@@ -173,6 +173,15 @@ func (dimb *DaptinImapMailBox) Status(items []imap.StatusItem) (*imap.MailboxSta
 			mbs.UidNext = nextUid
 		case imap.StatusUidValidity:
 			mbs.UidValidity = dimb.status.UidValidity
+		case imap.StatusItem("HIGHESTMODSEQ"):
+			highestmodseq, err := dimb.dbResource["mail_box"].GetMailBoxHighestModSeq(dimb.mailBoxId, nil)
+			if err != nil {
+				return nil, err
+			}
+			if mbs.Items == nil {
+				mbs.Items = map[imap.StatusItem]interface{}{}
+			}
+			mbs.Items[imap.StatusItem("HIGHESTMODSEQ")] = highestmodseq
 		}
 	}
 	return mbs, nil
@@ -236,6 +245,19 @@ func (dimb *DaptinImapMailBox) Check() error {
 //
 // Messages must be sent to ch. When the function returns, ch must be closed.
 func (dimb *DaptinImapMailBox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
+	return dimb.listMessages(uid, seqset, items, 0, ch)
+}
+
+// FetchChanged implements FETCH/UID FETCH with the CHANGEDSINCE modifier:
+// only messages whose modseq is strictly greater than since are returned, and
+// every returned message carries MODSEQ.
+func (dimb *DaptinImapMailBox) FetchChanged(uid bool, seqset *imap.SeqSet, items []imap.FetchItem,
+	since int64, ch chan<- *imap.Message) error {
+	return dimb.listMessages(uid, seqset, items, since, ch)
+}
+
+func (dimb *DaptinImapMailBox) listMessages(uid bool, seqset *imap.SeqSet, items []imap.FetchItem,
+	changedSince int64, ch chan<- *imap.Message) error {
 	defer close(ch)
 
 	transaction, err := dimb.dbResource["mail_box"].Connection().Beginx()
@@ -253,9 +275,15 @@ func (dimb *DaptinImapMailBox) ListMessages(uid bool, seqset *imap.SeqSet, items
 		return err
 	}
 
+	includeModSeq := changedSince > 0 || fetchItemsContain(items, "MODSEQ")
+
 	for _, selection := range selections {
 		mailContent, ok := mails[selection.ReferenceID]
 		if !ok {
+			continue
+		}
+		messageModSeq, _ := internalIdFromValue(mailContent["modseq"])
+		if changedSince > 0 && messageModSeq <= changedSince {
 			continue
 		}
 		//log.Printf("Return mailContent: %v", mailContent)
@@ -344,16 +372,20 @@ func (dimb *DaptinImapMailBox) ListMessages(uid bool, seqset *imap.SeqSet, items
 					}
 
 					if !section.Peek {
+						originalFlags := strings.Split(mailContent["flags"].(string), ",")
 						// Remove \Recent flag on non-PEEK fetch
 						if HasAnyFlag(flagList, []string{imap.RecentFlag}) {
 							flagList = backendutil.UpdateFlags(flagList, imap.RemoveFlags, []string{imap.RecentFlag})
 						}
 						// Set \Seen flag only on non-PEEK fetch
 						flagList = backendutil.UpdateFlags(flagList, imap.AddFlags, []string{imap.SeenFlag})
-						err = dimb.dbResource["mail"].UpdateMailFlags(
-							daptinid.InterfaceToDIR(mailContent["reference_id"]), flagList, dimb.sessionUser, transaction)
-						if err != nil {
-							return err
+						if !FlagsEqual(originalFlags, flagList) {
+							err = dimb.dbResource["mail"].UpdateMailFlags(
+								dimb.mailBoxId, daptinid.InterfaceToDIR(mailContent["reference_id"]), flagList,
+								dimb.sessionUser, transaction)
+							if err != nil {
+								return err
+							}
 						}
 					}
 
@@ -365,6 +397,9 @@ func (dimb *DaptinImapMailBox) ListMessages(uid bool, seqset *imap.SeqSet, items
 
 		if skipMail {
 			continue
+		}
+		if includeModSeq {
+			returnMail.Items["MODSEQ"] = []interface{}{messageModSeq}
 		}
 		//err = returnMail.Parse(responseItems)
 		//if err != nil {
@@ -633,8 +668,14 @@ func (dimb *DaptinImapMailBox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet
 			}
 		}
 		newFlags = dedupedFlags
-		err = dimb.dbResource["mail"].UpdateMailFlags(
-			daptinid.InterfaceToDIR(mailRow["reference_id"]), newFlags, dimb.sessionUser, transaction)
+		if !FlagsEqual(currentFlags, newFlags) {
+			err = dimb.dbResource["mail"].UpdateMailFlags(
+				dimb.mailBoxId, daptinid.InterfaceToDIR(mailRow["reference_id"]), newFlags,
+				dimb.sessionUser, transaction)
+			if err != nil {
+				return err
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -727,6 +768,95 @@ func (dimb *DaptinImapMailBox) CopyMessages(uid bool, seqset *imap.SeqSet, dest 
 			return err
 		}
 	}
+	return transaction.Commit()
+}
+
+// MoveMessages atomically moves the specified messages to the end of the
+// destination mailbox: each message gets a new UID, Recent is set, flags and
+// internal date are preserved, and the source messages are deleted with
+// deletion history, all in one transaction.
+//
+// If the destination mailbox does not exist, an error is returned and no
+// changes are made; it is not automatically created.
+func (dimb *DaptinImapMailBox) MoveMessages(uid bool, seqset *imap.SeqSet, dest string) error {
+	transaction, err := dimb.dbResource["mail"].Connection().Beginx()
+	if err != nil {
+		return err
+	}
+	defer transaction.Rollback()
+
+	destinationMailBox, err := dimb.dbResource["mail_box"].GetMailAccountBox(dimb.mailAccountId, dest, transaction)
+	if err != nil {
+		return err
+	}
+
+	requestURL, _ := url.Parse("/api/mail")
+	plainRequest := (&http.Request{
+		Method: http.MethodPost,
+		URL:    requestURL,
+	}).WithContext(context.WithValue(context.Background(), "user", dimb.sessionUser))
+	req := api2go.Request{PlainRequest: plainRequest}
+
+	selections, err := dimb.dbResource["mail"].SelectMailBoxCandidates(dimb.mailBoxId, uid, seqset, transaction)
+	if err != nil {
+		return err
+	}
+	mails, err := dimb.readSelectedMails(selections, true, transaction)
+	if err != nil {
+		return err
+	}
+
+	processed := map[daptinid.DaptinReferenceId]bool{}
+	for _, selection := range selections {
+		if processed[selection.ReferenceID] {
+			continue
+		}
+		mail, ok := mails[selection.ReferenceID]
+		if !ok {
+			continue
+		}
+
+		newUid, err := dimb.dbResource["mail_box"].AllocateMailBoxUid(destinationMailBox["id"].(int64), transaction)
+		if err != nil {
+			return err
+		}
+		mailBytes, err := dimb.dbResource["mail"].MailColumnBytes("mail", "mail", mail["mail"])
+		if err != nil {
+			return err
+		}
+		storageKey, _ := mail["hash"].(string)
+		if storageKey == "" {
+			storageKey, _ = mail["mail_id"].(string)
+		}
+		mail["mail"] = dimb.dbResource["mail"].MailColumnValue("mail", "mail", mailBytes, storageKey)
+		mail["mail_box_id"] = destinationMailBox["reference_id"]
+
+		delete(mail, "reference_id")
+		delete(mail, "updated_at")
+		delete(mail, "created_at")
+		delete(mail, "id")
+		mail["uid"] = newUid
+		mail["recent"] = true
+		mailFlags := strings.Split(mail["flags"].(string), ",")
+		if !HasAnyFlag(mailFlags, []string{imap.RecentFlag}) {
+			mailFlags = backendutil.UpdateFlags(mailFlags, imap.AddFlags, []string{imap.RecentFlag})
+			mail["flags"] = strings.Join(mailFlags, ",")
+		}
+		if _, err := dimb.dbResource["mail"].createAfterAuthorizationWithTransaction(api2go.NewApi2GoModelWithData(
+			"mail", nil, 768, nil, mail), req, transaction); err != nil {
+			return err
+		}
+
+		// Delete the source message; deletion history is written by the core
+		// delete path. The source row is reloaded, so mutations of mail above
+		// do not affect this step.
+		if _, err := dimb.dbResource["mail"].deleteAfterAuthorizationWithTransaction(
+			selection.ReferenceID, req, transaction); err != nil {
+			return err
+		}
+		processed[selection.ReferenceID] = true
+	}
+
 	return transaction.Commit()
 }
 
