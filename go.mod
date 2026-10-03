@@ -43,6 +43,7 @@ require (
 	github.com/emersion/go-vcard v0.0.0-20241024213814-c9703dde27ff
 	github.com/emersion/go-webdav v0.7.0
 	github.com/flysnow-org/soha v0.0.0-20191204153003-307ff1f8b4d8
+	github.com/foxcpp/go-sieve v0.0.0-00010101000000-000000000000
 	github.com/getkin/kin-openapi v0.110.0
 	github.com/ghodss/yaml v1.0.0
 	github.com/gin-contrib/gzip v0.0.6
@@ -408,6 +409,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	moul.io/http2curl/v2 v2.3.0 // indirect
+	rsc.io/binaryregexp v0.2.0 // indirect
 	storj.io/common v0.0.0-20250507192132-0c51beb4a743 // indirect
 	storj.io/drpc v0.0.35-0.20240709171858-0075ac871661 // indirect
 	storj.io/eventkit v0.0.0-20250410172343-61f26d3de156 // indirect
@@ -421,3 +423,5 @@ replace github.com/buraksezer/olric v0.5.7 => github.com/daptin/olric v0.5.7-dap
 //replace github.com/Azure/go-autorest => github.com/Azure/go-autorest v13.0.0+incompatible
 
 //replace github.com/daptin/daptin v0.9.6 => github.com/Ghvstcode/daptin v0.9.6
+
+replace github.com/foxcpp/go-sieve => ./third_party/go-sieve

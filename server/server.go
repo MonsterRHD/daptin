@@ -441,6 +441,18 @@ func NewRuntime(ctx context.Context, boxRoot http.FileSystem, db database.Databa
 
 	transaction, err = db.Beginx()
 	if err != nil {
+		return nil, fmt.Errorf("begin ManageSieve configuration transaction: %w", err)
+	}
+	if manageSieveErr := InitializeManageSieveResourcesOrError(
+		configStore, transaction, cruds, certificateManager, runtimeErrors); manageSieveErr != nil {
+		_ = transaction.Rollback()
+		log.WithError(manageSieveErr).Error("ManageSieve is disabled for this runtime; correct its backend configuration and restart Daptin")
+	} else if commitErr := transaction.Commit(); commitErr != nil {
+		return nil, fmt.Errorf("commit ManageSieve configuration transaction: %w", commitErr)
+	}
+
+	transaction, err = db.Beginx()
+	if err != nil {
 		return nil, fmt.Errorf("begin CalDAV configuration transaction: %w", err)
 	}
 	enableCaldav, err := configStore.GetConfigValueFor("caldav.enable", "backend", transaction)

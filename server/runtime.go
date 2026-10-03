@@ -28,6 +28,7 @@ type Runtime struct {
 	ftpServer               *ftpserver.FtpServer
 	ftpConnections          *ConnectionTracker
 	imapServer              *imapserver.Server
+	manageSieve             *resource.ManageSieveServer
 	websocketServer         *websockets.Server
 	yjs                     *YjsRuntime
 	llmGateway              *llm.Gateway
@@ -58,6 +59,11 @@ func (r *Runtime) Quiesce() error {
 		}
 		if r.imapServer != nil {
 			r.quiesceErr = r.imapServer.Close()
+		}
+		if r.manageSieve != nil {
+			if closeErr := r.manageSieve.Close(); r.quiesceErr == nil {
+				r.quiesceErr = closeErr
+			}
 		}
 	})
 	return r.quiesceErr

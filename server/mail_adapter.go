@@ -18,7 +18,6 @@ import (
 	daptinid "github.com/daptin/daptin/server/id"
 	"github.com/daptin/daptin/server/resource"
 	_ "github.com/emersion/go-message/charset"
-	mailpacket "github.com/emersion/go-message/mail"
 	"github.com/emersion/go-msgauth/dkim"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
@@ -54,8 +53,12 @@ type stmtCache [backends.GuerrillaDBAndRedisBatchMax]*sql.Stmt
 
 type SQLProcessorConfig struct {
 	PrimaryHost string `json:"primary_mail_host"`
-	DbResource  *resource.DbResource
 }
+
+// temporaryDeliveryResult is returned when local delivery fails after the
+// transaction rolled back. It starts with 451 so sending MTAs treat it as a
+// temporary failure and retry instead of bouncing the message.
+const temporaryDeliveryResult = "451 4.3.0 Temporary local delivery failure, please retry later"
 
 type SQLProcessor struct {
 	cache  stmtCache
@@ -195,14 +198,6 @@ func DaptinSmtpDbResource(dbResource *resource.DbResource, certificateManager *r
 						e.QueuedId = e.Hashes[0]
 					}
 					mailBytes := e.Data.Bytes()
-					searchMetadata, metadataErr := resource.ExtractMailSearchMetadata(mailBytes)
-					if metadataErr != nil {
-						log.Warnf("Failed to extract complete mail search metadata; storing raw message: %v", metadataErr)
-					}
-					var sentDate interface{}
-					if !searchMetadata.SentDate.IsZero() {
-						sentDate = searchMetadata.SentDate
-					}
 
 					//if c, ok := e.Values["zlib-compressor"]; ok {
 					//	co = c.(Compressor)
@@ -210,33 +205,13 @@ func DaptinSmtpDbResource(dbResource *resource.DbResource, certificateManager *r
 
 					for i := range e.RcptTo {
 						rcpt := e.RcptTo[i]
-						mid := trimToLimit(s.fillAddressFromHeader(e, "Message-Id"), 255)
-						if mid == "" {
-							mid = fmt.Sprintf("%s.%s@%s", hash, rcpt.User, config.PrimaryHost)
-						}
 						recipient := trimToLimit(strings.TrimSpace(rcpt.String()), 255)
 						contentType := ""
 						if v, ok := e.Header["Content-Type"]; ok {
 							contentType = trimToLimit(v[0], 255)
 						}
 
-						parsedMail, err := mailpacket.CreateReader(bytes.NewReader(mailBytes))
-						if err != nil {
-							log.Warnf("Failed to extract mail attachment metadata; storing raw message: %v", err)
-						}
-
 						log.Printf("Authorized login: %v", e.AuthorizedLogin)
-
-						var mailSize int
-						// `mail` column
-
-						mailSize = len(mailBytes)
-						mailBody := dbResource.Cruds["mail"].MailColumnValue("mail", "mail", mailBytes, hash)
-						ur, _ := url.Parse("/api/mail")
-						pr := &http.Request{
-							URL:    ur,
-							Method: "POST",
-						}
 
 						transaction, err := dbResource.Connection().Beginx()
 						if err != nil {
@@ -415,10 +390,8 @@ func DaptinSmtpDbResource(dbResource *resource.DbResource, certificateManager *r
 						// Score based on DKIM verification only (no blocking SMTP probe)
 						spamScore := 0
 
-						dkimResult, err := dkim.Verify(bytes.NewReader(mailBytes))
-						resource.CheckErr(err, "Failed to verify dkim signature in incoming mail")
-
-						if err != nil {
+						dkimResult, verifyErr := dkim.Verify(bytes.NewReader(mailBytes))
+						if verifyErr != nil {
 							spamScore += 50
 						}
 						for _, res := range dkimResult {
@@ -441,122 +414,28 @@ func DaptinSmtpDbResource(dbResource *resource.DbResource, certificateManager *r
 							continue
 						}
 
-						mailboxName := "INBOX"
-
-						if spamScore > 299 {
-							mailboxName = "Spam"
-						}
-
 						mailAccountId, _ := mailAccount["id"].(int64)
-						mailBox, err := dbResource.GetMailAccountBox(mailAccountId, mailboxName, transaction)
-
-						if err != nil {
-							err = dbResource.Cruds["mail_account"].LockMailAccountForMailboxCreation(mailAccountId, transaction)
-							if err != nil {
-								transaction.Rollback()
-								return backends.NewResult(fmt.Sprint("554 Error: could not lock mail account")), backends.StorageError
-							}
-							mailBox, err = dbResource.GetMailAccountBox(mailAccountId, mailboxName, transaction)
-							if err != nil {
-								mailBox, err = dbResource.CreateMailAccountBox(
-									daptinid.InterfaceToDIR(mailAccount["reference_id"]).String(),
-									sessionUser,
-									mailboxName, transaction)
-								if err != nil {
-									transaction.Rollback()
-									continue
-								}
-								mailBox, err = dbResource.GetMailAccountBox(mailAccountId, mailboxName, transaction)
-								if err != nil {
-									transaction.Rollback()
-									return backends.NewResult(fmt.Sprint("554 Error: could not load mailbox")), backends.StorageError
-								}
-							}
+						listenInterface := ""
+						if value, ok := e.Values["listen_interface"].(string); ok {
+							listenInterface = value
 						}
-						mailBoxId, ok := mailBox["id"].(int64)
-						if !ok || mailBoxId == 0 {
+						info := resource.InboundMessageInfo{
+							Recipient:       recipient,
+							RemoteIP:        e.RemoteIP,
+							TLS:             e.TLS,
+							ContentType:     contentType,
+							ReturnPath:      trimToLimit(e.MailFrom.String(), 255),
+							ListenInterface: listenInterface,
+							PrimaryHost:     config.PrimaryHost,
+							Hash:            hash,
+						}
+						if err = dbResource.DeliverInboundWithSieve(mailAccountId, sessionUser,
+							mailBytes, info, e.MailFrom.String(), spamScore, transaction); err != nil {
 							transaction.Rollback()
-							return backends.NewResult(fmt.Sprint("554 Error: invalid mailbox id")), backends.StorageError
-						}
-						uid, err := dbResource.Cruds["mail_box"].AllocateMailBoxUid(mailBoxId, transaction)
-						if err != nil {
-							transaction.Rollback()
-							return backends.NewResult(fmt.Sprint("554 Error: could not allocate mailbox uid")), backends.StorageError
-						}
-
-						pr = pr.WithContext(context.WithValue(context.Background(), "user", sessionUser))
-
-						req := &api2go.Request{
-							PlainRequest: pr,
-						}
-
-						spam := false
-						flags := "\\Recent"
-						if spamScore > 50 {
-							flags += ",Spam"
-							spam = true
-						}
-
-						hasAttachment := false
-						if parsedMail != nil {
-							for {
-								part, partErr := parsedMail.NextPart()
-								if partErr != nil {
-									break
-								}
-								_, ok := part.Header.(*mailpacket.AttachmentHeader)
-								if ok {
-									hasAttachment = true
-									break
-								}
-							}
-						}
-
-						// Permission 768 = Owner read (256) + Owner write (512)
-						// This ensures only the mail owner can read/write their mail
-						model := api2go.NewApi2GoModelWithData("mail",
-							nil, 768, nil, map[string]interface{}{
-								"message_id":       mid,
-								"mail_id":          hash,
-								"from_address":     searchMetadata.From,
-								"to_address":       searchMetadata.To,
-								"cc_address":       searchMetadata.Cc,
-								"bcc_address":      searchMetadata.Bcc,
-								"sender_address":   searchMetadata.Sender,
-								"subject":          searchMetadata.Subject,
-								"body":             searchMetadata.Body,
-								"mail":             mailBody,
-								"spam_score":       spamScore,
-								"spam":             spam,
-								"hash":             hash,
-								"content_type":     contentType,
-								"reply_to_address": searchMetadata.ReplyTo,
-								"internal_date":    time.Now(),
-								"sent_date":        sentDate,
-								"recipient":        recipient,
-								"has_attachment":   hasAttachment,
-								"ip_addr":          e.RemoteIP,
-								"return_path":      trimToLimit(e.MailFrom.String(), 255),
-								"is_tls":           e.TLS,
-								"mail_box_id":      mailBox["reference_id"],
-								"user_account_id":  mailAccount["user_account_id"],
-								"uid":              uid,
-								"seen":             false,
-								"recent":           true,
-								"flags":            flags,
-								"size":             mailSize,
-							})
-						_, err = dbResource.Cruds["mail"].CreateInboundMailWithTransaction(model, *req, transaction)
-						resource.CheckErr(err, "Failed to store mail")
-						//err1 := dbResource.Cruds["mail"].IncrementMailBoxUid(mailBox["id"].(int64), nextUid+1)
-						//resource.CheckErr(err1, "Failed to increment uid for mailbox")
-
-						if err != nil {
-							transaction.Rollback()
-							return backends.NewResult(fmt.Sprint("554 Error: could not save email")), backends.StorageError
+							return backends.NewResult(temporaryDeliveryResult), backends.StorageError
 						}
 						if err := transaction.Commit(); err != nil {
-							return backends.NewResult(fmt.Sprint("554 Error: could not save email")), backends.StorageError
+							return backends.NewResult(temporaryDeliveryResult), backends.StorageError
 						}
 					}
 
